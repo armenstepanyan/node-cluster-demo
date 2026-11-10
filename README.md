@@ -18,6 +18,9 @@ Open http://localhost:3000. The dashboard fires `GET /user` every 200 ms and cha
 | `GET /crash` | Exits the process with code 1, so the cluster primary forks a replacement |
 | `GET /info` | Mode, pid, and worker count |
 
+## Demo
+![demo](./demo.gif)
+
 Notes:
 
 - Browsers allow about 6 concurrent connections per host, so the dashboard caps "Send" at 5 requests. Use `autocannon` or `curl` for more.
