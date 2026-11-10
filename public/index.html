@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Event Loop Monitor</title>
+  <link rel="icon" href="data:," />
+  <style>
+    :root {
+      --bg: #0f1117; --panel: #171a23; --line: #262b38; --text: #e6e8ee; --muted: #8a91a5;
+      --green: #3fb950; --amber: #d29922; --red: #f85149; --blue: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px 28px; background: var(--bg); color: var(--text);
+           font: 14px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin-bottom: 18px; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line);
+             background: var(--panel); margin-right: 6px; font-size: 12px; }
+    .badge b { color: var(--blue); }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+    .panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+    .stat .v { font-size: 26px; font-weight: 600; }
+    .stat .k { color: var(--muted); font-size: 12px; }
+    .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+    button, select, input { background: #222736; color: var(--text); border: 1px solid #343b4e; border-radius: 6px;
+                            padding: 7px 12px; font: inherit; }
+    button { cursor: pointer; }
+    button.primary { background: #a4282a; border-color: #c93c3e; }
+    button.ok { background: #1f6f3b; border-color: #2c8a4c; }
+    input[type=number] { width: 64px; }
+    svg { width: 100%; height: 260px; display: block; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    td, th { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 500; }
+    .pending { color: var(--amber); }
+    .slow { color: var(--red); font-weight: 600; }
+    .fast { color: var(--green); }
+    .status { font-size: 15px; padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-weight: 600; }
+    .status.healthy { background: rgba(63,185,80,.12); color: var(--green); border: 1px solid rgba(63,185,80,.35); }
+    .status.blocked { background: rgba(248,81,73,.12); color: var(--red); border: 1px solid rgba(248,81,73,.35); }
+    .mono { font-family: Consolas, "Cascadia Mono", monospace; }
+  </style>
+</head>
+<body>
+  <h1>Event Loop Monitor</h1>
+  <div class="sub">
+    <span class="badge">mode: <b id="mode">…</b></span>
+    <span class="badge">workers: <b id="workers">…</b></span>
+    <span class="badge">a new GET /user request is fired every 200 ms</span>
+  </div>
+
+  <div class="controls">
+    <label>Send <input id="count" type="number" min="1" max="5" value="1" /> request(s) to</label>
+    <select id="endpoint">
+      <option value="/block-loop">/block-loop (sync, main thread)</option>
+      <option value="/block-thread">/block-thread (worker_threads)</option>
+    </select>
+    <button class="primary" id="send">Send</button>
+    <button id="crash">Crash a worker</button>
+    <button class="ok" id="toggle">Pause polling</button>
+  </div>
+
+  <div id="status" class="status healthy">Server is responsive</div>
+
+  <div class="stats">
+    <div class="panel stat"><div class="v mono" id="last">–</div><div class="k">/user requests stuck right now</div></div>
+    <div class="panel stat"><div class="v mono" id="fastpct">–</div><div class="k">/user answered in &lt; 100 ms</div></div>
+    <div class="panel stat"><div class="v mono" id="max">–</div><div class="k">slowest /user (last 60)</div></div>
+    <div class="panel stat"><div class="v mono" id="pids">–</div><div class="k">distinct PIDs that answered</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>GET /user latency (each bar = one request)</h2>
+      <svg id="chart" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="panel">
+      <h2>Requests</h2>
+      <table>
+        <thead><tr><th>endpoint</th><th>pid</th><th>time</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  const MAX_SAMPLES = 60, POLL_MS = 200, Y_MAX = 6000, W = 800, H = 260, PAD_L = 44, PAD_B = 18;
+  const samples = []; // { ms, pid, pending, start }
+  const log = [];     // { endpoint, pid, ms, pending, start }
+  let polling = true;
+
+  const $ = (id) => document.getElementById(id);
+  const fmt = (ms) => ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`;
+  const cls = (ms) => ms < 100 ? "fast" : ms < 1000 ? "pending" : "slow";
+  const color = (ms) => ms < 100 ? "var(--green)" : ms < 1000 ? "var(--amber)" : "var(--red)";
+  const get =  (url) => fetch(`${url}${url.includes("?") ? "&" : "?"}r=${Math.random()}`, { cache: "no-store" }).then((r) => r.json());
+
+  async function poll() {
+    const s = { start: performance.now(), pending: true, ms: 0, pid: null };
+    samples.push(s);
+    if (samples.length > MAX_SAMPLES) samples.shift();
+    try {
+      s.pid = (await get("/user")).pid;
+    } catch { s.pid = "error"; }
+    s.ms = performance.now() - s.start;
+    s.pending = false;
+  }
+
+  // Fire a /user request every POLL_MS without waiting for the previous one,
+  // like independent users hitting the API.
+  function pollLoop() {
+    setInterval(() => { if (polling) poll(); }, POLL_MS);
+  }
+
+  async function send(endpoint) {
+    const entry = { endpoint, pid: null, start: performance.now(), pending: true, ms: 0 };
+    log.unshift(entry);
+    if (log.length > 12) log.pop();
+    try { entry.pid = (await get(endpoint)).pid; } catch { entry.pid = "error"; }
+    entry.ms = performance.now() - entry.start;
+    entry.pending = false;
+  }
+
+  function render() {
+    const now = performance.now();
+    for (const s of samples) if (s.pending) s.ms = now - s.start;
+    for (const e of log) if (e.pending) e.ms = now - e.start;
+
+    const svg = [];
+    for (let t = 0; t <= Y_MAX; t += 1000) {
+      const y = (H - PAD_B) - (t / Y_MAX) * (H - PAD_B - 6);
+      svg.push(`<line x1="${PAD_L}" x2="${W}" y1="${y}" y2="${y}" stroke="#262b38"/>`);
+      svg.push(`<text x="${PAD_L - 6}" y="${y + 4}" fill="#8a91a5" font-size="11" text-anchor="end">${t / 1000}s</text>`);
+    }
+    const bw = (W - PAD_L) / MAX_SAMPLES;
+    samples.forEach((s, i) => {
+      const h = Math.max(2, Math.min(s.ms, Y_MAX) / Y_MAX * (H - PAD_B - 6));
+      const x = PAD_L + i * bw + 1;
+      svg.push(`<rect x="${x}" y="${H - PAD_B - h}" width="${bw - 2}" height="${h}" rx="2" fill="${color(s.ms)}" opacity="${s.pending ? 0.6 : 1}"/>`);
+    });
+    $("chart").innerHTML = svg.join("");
+
+    const stuck = samples.filter((s) => s.pending && s.ms > 300);
+    // Requests stuck longer than 100 ms already count as "not fast".
+    const judged = samples.filter((s) => !s.pending || s.ms >= 100);
+    const fastPct = judged.length ? Math.round(judged.filter((s) => !s.pending && s.ms < 100).length / judged.length * 100) : 100;
+    $("last").textContent = stuck.length;
+    $("last").className = `v mono ${stuck.length ? "slow" : "fast"}`;
+    $("fastpct").textContent = `${fastPct}%`;
+    $("fastpct").className = `v mono ${fastPct > 90 ? "fast" : fastPct > 50 ? "pending" : "slow"}`;
+    const max = Math.max(0, ...samples.map((s) => s.ms));
+    $("max").textContent = fmt(max); $("max").className = `v mono ${cls(max)}`;
+    const recentPids = new Set(samples.slice(-30).filter((s) => typeof s.pid === "number").map((s) => s.pid));
+    $("pids").textContent = recentPids.size;
+
+    const oldest = Math.max(0, ...stuck.map((s) => s.ms));
+    $("status").className = `status ${stuck.length ? "blocked" : "healthy"}`;
+    $("status").textContent = stuck.length
+      ? `${stuck.length} GET /user request(s) stuck, oldest waiting ${fmt(oldest)}: an event loop is blocked`
+      : "Server is responsive";
+
+    $("log").innerHTML = log.map((e) => `<tr>
+        <td class="mono">${e.endpoint}</td>
+        <td class="mono">${e.pid ?? "…"}</td>
+        <td class="mono ${e.pending ? "pending" : cls(e.ms)}">${e.pending ? "⏳ " : ""}${fmt(e.ms)}</td>
+      </tr>`).join("");
+    requestAnimationFrame(render);
+  }
+
+  $("send").onclick = () => {
+    const n = Number($("count").value) || 1;
+    for (let i = 0; i < n; i++) send($("endpoint").value);
+  };
+  $("crash").onclick = () => send("/crash");
+  $("toggle").onclick = () => {
+    polling = !polling;
+    $("toggle").textContent = polling ? "Pause polling" : "Resume polling";
+  };
+
+  get("/info").then((i) => { $("mode").textContent = i.mode; $("workers").textContent = i.workers; });
+  pollLoop();
+  render();
+</script>
+</body>
+</html>
